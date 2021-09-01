@@ -7,6 +7,7 @@
 @import TwilioVoice;
 
 NSString * const kCachedDeviceToken = @"CachedDeviceToken";
+NSString * const kCachedAccessToken = @"CachedAccessToken";
 NSString * const kCallerNameCustomParameter = @"CallerName";
 
 @interface RNTwilioVoice () <PKPushRegistryDelegate, TVONotificationDelegate, TVOCallDelegate, CXProviderDelegate>
@@ -18,6 +19,7 @@ NSString * const kCallerNameCustomParameter = @"CallerName";
 @property (nonatomic, strong) TVODefaultAudioDevice *audioDevice;
 @property (nonatomic, strong) NSMutableDictionary *activeCallInvites;
 @property (nonatomic, strong) NSMutableDictionary *activeCalls;
+@property (nonatomic, strong) NSMutableDictionary *activeCallsExtraInfo;
 
 // activeCall represents the last connected call
 @property (nonatomic, strong) TVOCall *activeCall;
@@ -31,7 +33,6 @@ NSString * const kCallerNameCustomParameter = @"CallerName";
   NSMutableDictionary *_settings;
   NSMutableDictionary *_callParams;
   NSString *_tokenUrl;
-  NSString *_token;
 }
 
 NSString * const StateConnecting = @"CONNECTING";
@@ -61,13 +62,20 @@ RCT_EXPORT_MODULE()
   [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
-RCT_EXPORT_METHOD(initWithAccessToken:(NSString *)token) {
-  _token = token;
-  [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleAppTerminateNotification) name:UIApplicationWillTerminateNotification object:nil];
+RCT_EXPORT_METHOD(registerWithToken:(NSString *)token) {
+  NSLog(@"Registering device token");
+  [[NSUserDefaults standardUserDefaults] setObject:token forKey:kCachedAccessToken];
   [self initPushRegistry];
+  [self registerDeviceWithTwilio];
 }
 
-RCT_EXPORT_METHOD(configureCallKit: (NSDictionary *)params) {
+- (void)initialize: (NSDictionary *)callKitParams {
+    [self configureCallKit:callKitParams];
+    [self initPushRegistry];
+  [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleAppTerminateNotification) name:UIApplicationWillTerminateNotification object:nil];
+}
+
+- (void)configureCallKit: (NSDictionary *)params {
   if (self.callKitCallController == nil) {
       /*
        * The important thing to remember when providing a TVOAudioDevice is that the device must be set
@@ -79,6 +87,7 @@ RCT_EXPORT_METHOD(configureCallKit: (NSDictionary *)params) {
 
       self.activeCallInvites = [NSMutableDictionary dictionary];
       self.activeCalls = [NSMutableDictionary dictionary];
+      self.activeCallsExtraInfo = [NSMutableDictionary dictionary];
 
     _settings = [[NSMutableDictionary alloc] initWithDictionary:params];
     CXProviderConfiguration *configuration = [[CXProviderConfiguration alloc] initWithLocalizedName:params[@"appName"]];
@@ -181,6 +190,11 @@ RCT_REMAP_METHOD(getActiveCall,
         } else if (self.activeCall.state == TVOCallStateDisconnected) {
             [params setObject:StateDisconnected forKey:@"call_state"];
         }
+
+        id extraCallInfo = self.activeCallsExtraInfo[self.activeCall.uuid.UUIDString];
+        if (extraCallInfo) {
+            [params setObject:extraCallInfo forKey:@"custom_params"];
+        }
     }
     resolve(params);
 }
@@ -201,16 +215,28 @@ RCT_REMAP_METHOD(getCallInvite,
         if (callInvite.to) {
             [params setObject:callInvite.to forKey:@"call_to"];
         }
+        if (callInvite.customParameters) {
+            [params setObject:callInvite.customParameters forKey:@"custom_params"];
+        }
     }
     resolve(params);
 }
 
+/**
+ * Configure push kit to receive VoIP push notifications. If this has already
+ * been called it will be a no-op.
+ */
 - (void)initPushRegistry {
-  self.voipRegistry = [[PKPushRegistry alloc] initWithQueue:dispatch_get_main_queue()];
-  self.voipRegistry.delegate = self;
-  self.voipRegistry.desiredPushTypes = [NSSet setWithObject:PKPushTypeVoIP];
+    if (self.voipRegistry == nil) {
+      self.voipRegistry = [[PKPushRegistry alloc] initWithQueue:dispatch_get_main_queue()];
+      self.voipRegistry.delegate = self;
+      self.voipRegistry.desiredPushTypes = [NSSet setWithObject:PKPushTypeVoIP];
+    }
 }
 
+/**
+ * Get the Twilio access token.
+ */
 - (NSString *)fetchAccessToken {
   if (_tokenUrl) {
     NSString *accessToken = [NSString stringWithContentsOfURL:[NSURL URLWithString:_tokenUrl]
@@ -218,8 +244,41 @@ RCT_REMAP_METHOD(getCallInvite,
                                                         error:nil];
     return accessToken;
   } else {
-    return _token;
+    NSString *cachedAccessToken = [[NSUserDefaults standardUserDefaults] objectForKey:kCachedAccessToken];
+    return cachedAccessToken;
   }
+}
+
+/**
+ * Register this device with Twilio. Both the device token and the access token
+ * granting the voice permission need to be available at this point or the
+ * method becomes a no-op.
+ */
+- (void) registerDeviceWithTwilio {
+    NSString *accessToken = [self fetchAccessToken];
+    NSString *deviceToken = [[NSUserDefaults standardUserDefaults] objectForKey:kCachedDeviceToken];
+
+    if (accessToken == nil || deviceToken == nil) {
+        NSLog(@"Can't register with Twilio without both the access token and device token ... skipping for now");
+        return;
+    }
+
+    [TwilioVoice registerWithAccessToken:accessToken
+                             deviceToken:deviceToken
+                              completion:^(NSError *error) {
+         if (error) {
+             NSLog(@"An error occurred while registering: %@", [error localizedDescription]);
+             NSMutableDictionary *params = [[NSMutableDictionary alloc] init];
+             [params setObject:[error localizedDescription] forKey:@"err"];
+
+             [self sendEventWithName:@"deviceNotReady" body:params];
+         }
+         else {
+             NSLog(@"Successfully registered for VoIP push notifications.");
+
+             [self sendEventWithName:@"deviceReady" body:nil];
+         }
+     }];
 }
 
 #pragma mark - PKPushRegistryDelegate
@@ -232,35 +291,8 @@ RCT_REMAP_METHOD(getCallInvite,
                                                         ntohl(tokenBytes[0]), ntohl(tokenBytes[1]), ntohl(tokenBytes[2]),
                                                         ntohl(tokenBytes[3]), ntohl(tokenBytes[4]), ntohl(tokenBytes[5]),
                                                         ntohl(tokenBytes[6]), ntohl(tokenBytes[7])];
-    NSString *accessToken = [self fetchAccessToken];
-    NSString *cachedDeviceToken = [[NSUserDefaults standardUserDefaults] objectForKey:kCachedDeviceToken];
-    if (![cachedDeviceToken isEqualToString:deviceTokenString]) {
-        cachedDeviceToken = deviceTokenString;
-
-        /*
-         * Perform registration if a new device token is detected.
-         */
-        [TwilioVoice registerWithAccessToken:accessToken
-                                 deviceToken:cachedDeviceToken
-                                  completion:^(NSError *error) {
-             if (error) {
-                 NSLog(@"An error occurred while registering: %@", [error localizedDescription]);
-                 NSMutableDictionary *params = [[NSMutableDictionary alloc] init];
-                 [params setObject:[error localizedDescription] forKey:@"err"];
-
-                 [self sendEventWithName:@"deviceNotReady" body:params];
-             }
-             else {
-                 NSLog(@"Successfully registered for VoIP push notifications.");
-
-                 /*
-                  * Save the device token after successfully registered.
-                  */
-                 [[NSUserDefaults standardUserDefaults] setObject:cachedDeviceToken forKey:kCachedDeviceToken];
-                 [self sendEventWithName:@"deviceReady" body:nil];
-             }
-         }];
-    }
+     [[NSUserDefaults standardUserDefaults] setObject:deviceTokenString forKey:kCachedDeviceToken];
+     [self registerDeviceWithTwilio];
   }
 }
 
@@ -369,6 +401,9 @@ withCompletionHandler:(void (^)(void))completion {
     if (callInvite.to) {
       [params setObject:callInvite.to forKey:@"call_to"];
     }
+    if (callInvite.customParameters) {
+      [params setObject:callInvite.customParameters forKey:@"custom_params"];
+    }
     [self sendEventWithName:@"deviceDidReceiveIncoming" body:params];
 }
 
@@ -398,6 +433,9 @@ withCompletionHandler:(void (^)(void))completion {
         }
         if (callInvite.to) {
             [params setObject:callInvite.to forKey:@"call_to"];
+        }
+        if (callInvite.customParameters) {
+            [params setObject:callInvite.customParameters forKey:@"custom_params"];
         }
         [self sendEventWithName:@"callInviteCancelled" body:params];
     }
@@ -430,6 +468,9 @@ withCompletionHandler:(void (^)(void))completion {
         }
         if (callInvite.to) {
             [params setObject:callInvite.to forKey:@"call_to"];
+        }
+        if (callInvite.customParameters) {
+            [params setObject:callInvite.customParameters forKey:@"custom_params"];
         }
         [self sendEventWithName:@"callInviteCancelled" body:params];
     }
@@ -476,6 +517,12 @@ withCompletionHandler:(void (^)(void))completion {
   if (call.to) {
     [callParams setObject:call.to forKey:@"call_to"];
   }
+
+  id extraCallInfo = self.activeCallsExtraInfo[call.uuid.UUIDString];
+  if (extraCallInfo) {
+    [callParams setObject:extraCallInfo forKey:@"custom_params"];
+  }
+
   [self sendEventWithName:@"connectionDidConnect" body:callParams];
 }
 
@@ -539,6 +586,7 @@ withCompletionHandler:(void (^)(void))completion {
         self.activeCall = nil;
     }
     [self.activeCalls removeObjectForKey:call.uuid.UUIDString];
+    [self.activeCallsExtraInfo removeObjectForKey:call.uuid.UUIDString];
 
     self.userInitiatedDisconnect = NO;
 
@@ -797,6 +845,7 @@ withCompletionHandler:(void (^)(void))completion {
         self.callKitCompletionCallback = completionHandler;
         self.activeCall = call;
         self.activeCalls[call.uuid.UUIDString] = call;
+        self.activeCallsExtraInfo[call.uuid.UUIDString] = callInvite.customParameters;
     }
 
     [self.activeCallInvites removeObjectForKey:callInvite.uuid.UUIDString];
