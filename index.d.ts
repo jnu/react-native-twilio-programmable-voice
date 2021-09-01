@@ -36,6 +36,7 @@ declare module "react-native-twilio-programmable-voice" {
       call_sid: string;
       call_from: string;
     }>;
+    type TokenFn = () => Promise<string>;
     function accept(): void
     function connect<T extends CallParams>(params: T): void
     function disconnect(): void
@@ -43,6 +44,8 @@ declare module "react-native-twilio-programmable-voice" {
     function getCallInvite(): Promise<CallInvite>
     function hold(holdValue: boolean): void
     function ignore(): void
+    function setAccessTokenFetcher(tokenFn: TokenFn): void
+    function registerWithTokenFunction(tokenFn: TokenFn): Promise<boolean>
     function registerWithToken(accessToken: string): Promise<boolean>
     function reject(): void
     function sendDigits(digits: string): void

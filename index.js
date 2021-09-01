@@ -24,7 +24,30 @@ const _eventHandlers = {
     callRejected: new Map(),
 }
 
+// Function to fetch a token from the server.
+let tokenFetcher = () => Promise.resolve('');
+
+NativeAppEventEmitter.addListener('requestAccessToken', async () => {
+  const token = await tokenFetcher();
+  if (!token) {
+    console.warn('[TwilioVoice] Failed to get access token');
+    return;
+  }
+
+  await TwilioVoice.continueWithToken(token);
+});
+
 const Twilio = {
+    // Set the access token fetcher function, but don't register device.
+    setAccessTokenFetcher(fn) {
+      tokenFetcher = fn;
+    },
+    // Set the access token fetcher function and use it to register this device.
+    async registerWithTokenFunction(fn) {
+      this.setAccessTokenFetcher(fn);
+      const token = await tokenFetcher();
+      return this.registerWithToken(token);
+    },
     // initialize the library with Twilio access token
     // return {initialized: true} when the initialization started
     // Listen to deviceReady and deviceNotReady events to see whether
